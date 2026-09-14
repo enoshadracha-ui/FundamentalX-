@@ -2,15 +2,13 @@ import os
 import time
 import threading
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import requests
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
+
 
 # ============================================================
 # CONFIG
@@ -24,24 +22,16 @@ EVENTS_URL = "https://api.quantgist.com/v2/events"
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# QuantGist free tier protection.
-# Calendar is refreshed at most every 15 minutes.
 CALENDAR_CACHE_SECONDS = 15 * 60
-
-# Detail cache.
 DETAIL_CACHE_SECONDS = 15 * 60
-
-# Background monitor interval.
 MONITOR_INTERVAL_SECONDS = 60
 
-# Alert windows.
 ALERT_WINDOWS = {
     "24H": 24 * 60,
     "1H": 60,
     "15M": 15,
 }
 
-# Only these event categories are considered.
 EVENT_KEYWORDS = [
     "NFP",
     "NON-FARM",
@@ -62,21 +52,14 @@ EVENT_KEYWORDS = [
     "ISM",
 ]
 
-HIGH_IMPACT = "high"
-
-# In-memory subscriber list.
 SUBSCRIBERS = set()
-
-# Prevent duplicate alerts.
 SENT_ALERTS = set()
 
-# Calendar cache.
 CALENDAR_CACHE = {
     "timestamp": 0,
     "events": [],
 }
 
-# Event-detail cache.
 EVENT_DETAIL_CACHE = {}
 
 logging.basicConfig(
@@ -88,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# BASIC HELPERS
+# TIME / TEXT HELPERS
 # ============================================================
 
 def now_utc():
@@ -100,7 +83,7 @@ def parse_datetime(value):
         return None
 
     try:
-        value = value.replace("Z", "+00:00")
+        value = str(value).replace("Z", "+00:00")
         dt = datetime.fromisoformat(value)
 
         if dt.tzinfo is None:
@@ -122,10 +105,7 @@ def format_datetime(value):
 
 
 def safe_value(value):
-    if value is None:
-        return "Not available"
-
-    if value == "":
+    if value is None or value == "":
         return "Not available"
 
     return str(value)
@@ -135,29 +115,13 @@ def normalize_text(value):
     return str(value or "").strip().lower()
 
 
-def event_matches_keywords(event):
-    title = normalize_text(
+def get_event_title(event):
+    return (
         event.get("title")
         or event.get("event_type")
         or event.get("title_normalized")
+        or "Economic Event"
     )
-
-    canonical = normalize_text(event.get("canonical_id"))
-
-    combined = f"{title} {canonical}"
-
-    return any(keyword.lower() in combined for keyword in EVENT_KEYWORDS)
-
-
-def is_high_impact(event):
-    impact = normalize_text(event.get("impact"))
-
-    return impact in {
-        "high",
-        "red",
-        "3",
-        "major",
-    }
 
 
 # ============================================================
@@ -190,19 +154,6 @@ def api_get(url, params=None):
 # ============================================================
 
 def flatten_calendar(payload):
-    """
-    QuantGist calendar can return grouped data:
-
-    data = [
-        {
-            "event_type": "...",
-            "data": [...]
-        }
-    ]
-
-    Flatten everything into one event list.
-    """
-
     groups = payload.get("data", [])
 
     events = []
@@ -222,36 +173,32 @@ def flatten_calendar(payload):
     return events
 
 
-def fetch_calendar_from_api(days=30):
+def fetch_calendar_from_api():
     """
     Fetch the QuantGist calendar.
 
-    This function does the actual API request.
+    No days parameter is sent here because the calendar endpoint
+    already returns its available calendar data.
     """
 
-    payload = api_get(
-        CALENDAR_URL,
-        params={
-            "days": days,
-        },
-    )
+    payload = api_get(CALENDAR_URL)
 
-    events = flatten_calendar(payload)
-
-    return events
+    return flatten_calendar(payload)
 
 
 def get_calendar(days=30, force=False):
     """
     Cached calendar.
 
-    The free QuantGist tier has a request limit, so we don't
-    hammer the API every minute.
+    The calendar is refreshed every 15 minutes instead of every
+    60 seconds so the free API allowance is not exhausted.
     """
 
     current_time = time.time()
 
-    cache_age = current_time - CALENDAR_CACHE["timestamp"]
+    cache_age = (
+        current_time - CALENDAR_CACHE["timestamp"]
+    )
 
     if (
         not force
@@ -262,7 +209,7 @@ def get_calendar(days=30, force=False):
 
     try:
 
-        events = fetch_calendar_from_api(days)
+        events = fetch_calendar_from_api()
 
         CALENDAR_CACHE["events"] = events
         CALENDAR_CACHE["timestamp"] = current_time
@@ -281,7 +228,6 @@ def get_calendar(days=30, force=False):
             exc,
         )
 
-        # Return old cache if available.
         return CALENDAR_CACHE["events"]
 
 
@@ -293,13 +239,6 @@ def get_event_detail_by_canonical(
     canonical_id,
     target_release_time=None,
 ):
-    """
-    QuantGist can return historical and future records for the
-    same canonical event.
-
-    Therefore we MUST match the release time instead of simply
-    taking data[0].
-    """
 
     if not canonical_id:
         return None
@@ -319,10 +258,12 @@ def get_event_detail_by_canonical(
         if not isinstance(records, list):
             return None
 
-        target_dt = parse_datetime(target_release_time)
+        target_dt = parse_datetime(
+            target_release_time
+        )
 
-        # If we know the target release time, find the matching
-        # event rather than using the first historical record.
+        # Match the detail record to the EXACT upcoming
+        # calendar release instead of taking data[0].
         if target_dt:
 
             best_record = None
@@ -330,15 +271,17 @@ def get_event_detail_by_canonical(
 
             for record in records:
 
-                release_time = record.get("release_time")
-
-                record_dt = parse_datetime(release_time)
+                record_dt = parse_datetime(
+                    record.get("release_time")
+                )
 
                 if not record_dt:
                     continue
 
                 difference = abs(
-                    (record_dt - target_dt).total_seconds()
+                    (
+                        record_dt - target_dt
+                    ).total_seconds()
                 )
 
                 if difference <= 5 * 60:
@@ -350,12 +293,9 @@ def get_event_detail_by_canonical(
                         best_record = record
                         best_difference = difference
 
-            if best_record:
-                return best_record
+            return best_record
 
-            return None
-
-        # If no target date was supplied, prefer a future event.
+        # If no target date was provided, find the next future record.
         current = now_utc()
 
         future_records = []
@@ -391,19 +331,42 @@ def get_event_detail_by_canonical(
         return None
 
 
+def merge_event_data(event, detail):
+    """
+    Only fundamental fields are taken from the detail endpoint.
+
+    The calendar remains the source of truth for event identity
+    and release time.
+    """
+
+    merged = dict(event)
+
+    allowed_fields = [
+        "actual",
+        "forecast",
+        "previous",
+        "revised_previous",
+        "surprise_pct",
+        "surprise_score",
+        "sentiment_score",
+        "sentiment_label",
+        "has_actual",
+        "has_forecast",
+    ]
+
+    for field in allowed_fields:
+
+        if field in detail:
+
+            value = detail.get(field)
+
+            if value is not None:
+                merged[field] = value
+
+    return merged
+
+
 def get_event_detail(event):
-    """
-    Enrich a calendar event with actual/forecast/previous.
-
-    IMPORTANT:
-    The calendar event remains the source of truth for:
-      - release_time
-      - title
-      - canonical_id
-      - impact
-
-    Detail endpoint is ONLY allowed to add fundamental values.
-    """
 
     canonical_id = event.get("canonical_id")
     release_time = event.get("release_time")
@@ -412,8 +375,7 @@ def get_event_detail(event):
         return event
 
     cache_key = (
-        f"{canonical_id}:"
-        f"{release_time}"
+        f"{canonical_id}:{release_time}"
     )
 
     current_time = time.time()
@@ -422,10 +384,8 @@ def get_event_detail(event):
 
     if cached:
 
-        cached_time = cached.get("timestamp", 0)
-
         if (
-            current_time - cached_time
+            current_time - cached["timestamp"]
             < DETAIL_CACHE_SECONDS
         ):
 
@@ -456,90 +416,126 @@ def get_event_detail(event):
     )
 
 
-def merge_event_data(event, detail):
-    """
-    Safely merge detail data without allowing stale historical
-    release_time/title/etc. to overwrite the calendar event.
-    """
-
-    merged = dict(event)
-
-    allowed_fields = [
-        "actual",
-        "forecast",
-        "previous",
-        "revised_previous",
-        "surprise_pct",
-        "surprise_score",
-        "sentiment_score",
-        "sentiment_label",
-        "has_actual",
-        "has_forecast",
-    ]
-
-    for field in allowed_fields:
-
-        if field in detail:
-
-            value = detail.get(field)
-
-            # Only overwrite if the provider actually returned
-            # something useful.
-            if value is not None:
-
-                merged[field] = value
-
-    return merged
-
-
 # ============================================================
 # UPCOMING EVENTS
 # ============================================================
 
 def get_upcoming_events(days=30):
     """
-    Return only future, high-impact events.
+    Return upcoming major economic events.
+
+    IMPORTANT:
+    The QuantGist calendar is the source of truth.
+
+    An event is NOT rejected just because the detail endpoint
+    doesn't contain forecast/previous/actual yet.
     """
 
     events = get_calendar(days)
 
     current = now_utc()
-
     end_time = current + timedelta(days=days)
 
     upcoming = []
 
-    for raw_event in events:
+    for event in events:
 
-        if not isinstance(raw_event, dict):
+        if not isinstance(event, dict):
             continue
 
-        if not is_high_impact(raw_event):
-            continue
-
-        if not event_matches_keywords(raw_event):
-            continue
-
-        release_time = raw_event.get("release_time")
+        release_time = (
+            event.get("release_time")
+            or event.get("date")
+            or event.get("datetime")
+            or event.get("scheduled_at")
+        )
 
         release_dt = parse_datetime(release_time)
 
         if not release_dt:
             continue
 
+        # Future events only.
         if release_dt < current:
             continue
 
         if release_dt > end_time:
             continue
 
-        enriched = get_event_detail(raw_event)
+        title = normalize_text(
+            event.get("title")
+            or event.get("event_type")
+            or event.get("title_normalized")
+            or ""
+        )
 
-        # Keep original calendar release time no matter what
-        # detail endpoint returns.
-        enriched["release_time"] = release_time
+        canonical = normalize_text(
+            event.get("canonical_id")
+            or ""
+        )
 
-        upcoming.append(enriched)
+        combined = f"{title} {canonical}"
+
+        # Only major events we care about.
+        important_event = any(
+            keyword.lower() in combined
+            for keyword in EVENT_KEYWORDS
+        )
+
+        if not important_event:
+            continue
+
+        # Missing impact is allowed.
+        # Only explicitly low-impact events are rejected.
+        impact = normalize_text(
+            event.get("impact")
+        )
+
+        if impact in {
+            "low",
+            "1",
+            "minor",
+        }:
+            continue
+
+        final_event = dict(event)
+
+        # Try to add actual/forecast/previous.
+        # Failure here MUST NOT remove the event.
+        try:
+
+            enriched = get_event_detail(event)
+
+            if enriched:
+                final_event.update(enriched)
+
+        except Exception as exc:
+
+            logger.warning(
+                "Detail enrichment failed for %s: %s",
+                title,
+                exc,
+            )
+
+        # Calendar release time ALWAYS wins.
+        final_event["release_time"] = release_time
+
+        if event.get("canonical_id"):
+            final_event["canonical_id"] = (
+                event.get("canonical_id")
+            )
+
+        if event.get("title"):
+            final_event["title"] = (
+                event.get("title")
+            )
+
+        if event.get("impact") is not None:
+            final_event["impact"] = (
+                event.get("impact")
+            )
+
+        upcoming.append(final_event)
 
     # Remove duplicates.
     unique = {}
@@ -547,7 +543,8 @@ def get_upcoming_events(days=30):
     for event in upcoming:
 
         key = (
-            event.get("canonical_id"),
+            event.get("canonical_id")
+            or event.get("title"),
             event.get("release_time"),
         )
 
@@ -556,10 +553,13 @@ def get_upcoming_events(days=30):
     upcoming = list(unique.values())
 
     upcoming.sort(
-        key=lambda event: parse_datetime(
-            event.get("release_time")
-        ) or datetime.max.replace(
-            tzinfo=timezone.utc
+        key=lambda event: (
+            parse_datetime(
+                event.get("release_time")
+            )
+            or datetime.max.replace(
+                tzinfo=timezone.utc
+            )
         )
     )
 
@@ -567,6 +567,7 @@ def get_upcoming_events(days=30):
 
 
 def get_today_events():
+
     current = now_utc()
 
     start = current.replace(
@@ -578,6 +579,8 @@ def get_today_events():
 
     end = start + timedelta(days=1)
 
+    # Today needs a slightly wider window because
+    # get_upcoming_events only returns future events.
     events = get_upcoming_events(days=2)
 
     result = []
@@ -598,25 +601,11 @@ def get_today_events():
 
 
 # ============================================================
-# EVENT TITLE
-# ============================================================
-
-def get_event_title(event):
-    title = (
-        event.get("title")
-        or event.get("event_type")
-        or event.get("title_normalized")
-        or "Economic Event"
-    )
-
-    return str(title)
-
-
-# ============================================================
-# ANALYSIS ENGINE
+# ANALYSIS
 # ============================================================
 
 def classify_event(event):
+
     title = normalize_text(
         get_event_title(event)
     )
@@ -672,8 +661,8 @@ def classify_event(event):
 
 
 def build_analysis(event, post_release=False):
-    event_type = classify_event(event)
 
+    event_type = classify_event(event)
     title = get_event_title(event)
 
     previous = event.get("previous")
@@ -707,87 +696,81 @@ def build_analysis(event, post_release=False):
                 forecast_num = float(forecast)
 
                 if actual_num > forecast_num:
-                    surprise = "Above forecast"
+                    result = "Above forecast"
+
                 elif actual_num < forecast_num:
-                    surprise = "Below forecast"
+                    result = "Below forecast"
+
                 else:
-                    surprise = "In line with forecast"
+                    result = "In line with forecast"
 
                 lines.append(
-                    f"Result: {surprise}"
+                    f"Result: {result}"
                 )
 
             except Exception:
 
                 lines.append(
-                    "Result: Compare the Actual and Forecast values."
+                    "Result: Compare Actual with Forecast."
                 )
 
         lines.append("")
 
         if event_type == "NFP":
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "The employment result can influence expectations "
-                "about economic strength and future monetary policy."
+                "The employment result can influence "
+                "expectations about economic strength "
+                "and monetary policy."
             )
 
         elif event_type in {"CPI", "PCE", "PPI"}:
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "Inflation data can influence expectations about "
-                "future interest-rate policy."
+                "Inflation data can influence expectations "
+                "about future interest-rate policy."
             )
 
         elif event_type == "FOMC":
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "The policy decision, statement and press conference "
-                "can change expectations about the Fed's policy path."
+                "The rate decision, statement and press "
+                "conference can change expectations about "
+                "the Fed's policy path."
             )
 
         elif event_type == "GDP":
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "GDP provides information about the pace of economic growth."
+                "GDP provides information about the pace "
+                "of economic growth."
             )
 
         elif event_type == "UNEMPLOYMENT":
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "The unemployment rate provides another measure of "
-                "labour-market conditions."
+                "The unemployment rate provides information "
+                "about labour-market conditions."
             )
 
         else:
 
+            lines.append("Why it matters:")
             lines.append(
-                "Why it matters:"
-            )
-            lines.append(
-                "The release can change expectations about economic "
-                "conditions and monetary policy."
+                "The release can change expectations about "
+                "economic conditions and monetary policy."
             )
 
         lines.append("")
         lines.append(
-            "Market reaction depends on the size of the surprise, "
-            "revisions, positioning and the wider macro environment."
+            "Market reaction depends on the size of the "
+            "surprise, revisions, positioning and the "
+            "wider macro environment."
         )
 
     else:
@@ -807,24 +790,26 @@ def build_analysis(event, post_release=False):
 
             lines.append("Why it matters:")
             lines.append(
-                "NFP measures changes in US non-farm employment "
-                "and is closely watched as a labour-market indicator."
+                "NFP measures changes in US non-farm "
+                "employment and is closely watched "
+                "as a labour-market indicator."
             )
 
         elif event_type in {"CPI", "PCE"}:
 
             lines.append("Why it matters:")
             lines.append(
-                "Inflation data helps markets assess price pressures "
-                "and possible monetary-policy changes."
+                "Inflation data helps markets assess "
+                "price pressures and possible monetary "
+                "policy changes."
             )
 
         elif event_type == "PPI":
 
             lines.append("Why it matters:")
             lines.append(
-                "Producer-price data provides information about "
-                "upstream price pressures."
+                "Producer-price data provides information "
+                "about upstream price pressures."
             )
 
         elif event_type == "FOMC":
@@ -839,55 +824,59 @@ def build_analysis(event, post_release=False):
 
             lines.append("Why it matters:")
             lines.append(
-                "GDP measures economic growth and provides information "
-                "about the strength of economic activity."
+                "GDP measures economic growth and provides "
+                "information about economic activity."
             )
 
         elif event_type == "UNEMPLOYMENT":
 
             lines.append("Why it matters:")
             lines.append(
-                "The unemployment rate provides information about "
-                "labour-market conditions."
+                "The unemployment rate provides information "
+                "about labour-market conditions."
             )
 
         elif event_type == "RETAIL_SALES":
 
             lines.append("Why it matters:")
             lines.append(
-                "Retail sales provide information about consumer spending."
+                "Retail sales provide information about "
+                "consumer spending."
             )
 
         else:
 
             lines.append("Why it matters:")
             lines.append(
-                "The release can affect expectations about economic "
-                "conditions and monetary policy."
+                "The release can affect expectations about "
+                "economic conditions and monetary policy."
             )
 
         lines.append("")
         lines.append("Scenario framework:")
 
         lines.append(
-            "• Above forecast → expectations may shift toward "
-            "stronger conditions or tighter policy, depending on the event."
+            "• Above forecast → expectations may shift "
+            "toward stronger conditions or tighter policy, "
+            "depending on the event."
         )
 
         lines.append(
-            "• Near forecast → attention may shift toward revisions, "
-            "details and wider macro context."
+            "• Near forecast → attention may shift toward "
+            "revisions, details and wider macro context."
         )
 
         lines.append(
-            "• Below forecast → expectations may shift toward "
-            "weaker conditions or less restrictive policy, depending on the event."
+            "• Below forecast → expectations may shift "
+            "toward weaker conditions or less restrictive "
+            "policy, depending on the event."
         )
 
     lines.append("")
     lines.append(
-        "⚠️ Educational macro analysis only — not a guaranteed "
-        "market direction or personalized trade signal."
+        "⚠️ Educational macro analysis only — not a "
+        "guaranteed market direction or personalized "
+        "trade signal."
     )
 
     return "\n".join(lines)
@@ -898,6 +887,7 @@ def build_analysis(event, post_release=False):
 # ============================================================
 
 def event_summary(event, number=None):
+
     title = get_event_title(event)
 
     release_time = format_datetime(
@@ -931,6 +921,7 @@ def event_summary(event, number=None):
 
 
 def alert_message(event, window_name):
+
     title = get_event_title(event)
 
     release_time = format_datetime(
@@ -961,6 +952,7 @@ def alert_message(event, window_name):
 
 
 def release_message(event):
+
     title = get_event_title(event)
 
     release_time = format_datetime(
@@ -984,10 +976,7 @@ def release_message(event):
 # TELEGRAM COMMANDS
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start_command(update, context):
 
     chat_id = update.effective_chat.id
 
@@ -1008,10 +997,7 @@ async def start_command(
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update, context):
 
     await update.message.reply_text(
         "📚 FundamentalX Commands\n\n"
@@ -1025,10 +1011,7 @@ async def help_command(
     )
 
 
-async def alerts_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def alerts_command(update, context):
 
     chat_id = update.effective_chat.id
 
@@ -1039,10 +1022,7 @@ async def alerts_command(
     )
 
 
-async def stopalerts_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def stopalerts_command(update, context):
 
     chat_id = update.effective_chat.id
 
@@ -1053,10 +1033,7 @@ async def stopalerts_command(
     )
 
 
-async def next_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def next_command(update, context):
 
     try:
 
@@ -1105,10 +1082,7 @@ async def next_command(
         )
 
 
-async def today_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def today_command(update, context):
 
     try:
 
@@ -1157,10 +1131,7 @@ async def today_command(
         )
 
 
-async def analysis_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def analysis_command(update, context):
 
     try:
 
@@ -1176,13 +1147,11 @@ async def analysis_command(
 
         event = events[0]
 
-        analysis = build_analysis(
-            event,
-            post_release=False,
-        )
-
         await update.message.reply_text(
-            analysis
+            build_analysis(
+                event,
+                post_release=False,
+            )
         )
 
     except Exception as exc:
@@ -1198,10 +1167,11 @@ async def analysis_command(
 
 
 # ============================================================
-# ALERT MONITOR
+# ALERT SYSTEM
 # ============================================================
 
 def alert_key(event, window_name):
+
     return (
         event.get("canonical_id")
         or event.get("title"),
@@ -1211,6 +1181,7 @@ def alert_key(event, window_name):
 
 
 def release_alert_key(event):
+
     return (
         event.get("canonical_id")
         or event.get("title"),
@@ -1246,11 +1217,6 @@ async def send_to_subscribers(
 
 
 async def monitor_events(application):
-    """
-    Background event monitor.
-
-    Calendar is cached for 15 minutes to respect the API limit.
-    """
 
     logger.info(
         "FundamentalX alert monitor started."
@@ -1283,14 +1249,15 @@ async def monitor_events(application):
                     seconds_remaining / 60
                 )
 
-                # ------------------------------------------------
+                # -------------------------------
                 # PRE-RELEASE ALERTS
-                # ------------------------------------------------
+                # -------------------------------
 
-                for window_name, target_minutes in ALERT_WINDOWS.items():
+                for (
+                    window_name,
+                    target_minutes,
+                ) in ALERT_WINDOWS.items():
 
-                    # Wider window than exact 1 minute so a
-                    # 60-second polling cycle doesn't miss it.
                     if abs(
                         minutes_remaining
                         - target_minutes
@@ -1306,19 +1273,17 @@ async def monitor_events(application):
 
                         SENT_ALERTS.add(key)
 
-                        message = alert_message(
-                            event,
-                            window_name,
-                        )
-
                         await send_to_subscribers(
                             application,
-                            message,
+                            alert_message(
+                                event,
+                                window_name,
+                            ),
                         )
 
-                # ------------------------------------------------
+                # -------------------------------
                 # POST-RELEASE ALERT
-                # ------------------------------------------------
+                # -------------------------------
 
                 if (
                     -15
@@ -1338,13 +1303,11 @@ async def monitor_events(application):
 
                             SENT_ALERTS.add(key)
 
-                            message = release_message(
-                                event
-                            )
-
                             await send_to_subscribers(
                                 application,
-                                message,
+                                release_message(
+                                    event
+                                ),
                             )
 
         except Exception as exc:
@@ -1354,19 +1317,9 @@ async def monitor_events(application):
                 exc,
             )
 
-        await asyncio_sleep(
+        await asyncio.sleep(
             MONITOR_INTERVAL_SECONDS
         )
-
-
-async def asyncio_sleep(seconds):
-    """
-    Small async-compatible sleep helper.
-    """
-
-    import asyncio
-
-    await asyncio.sleep(seconds)
 
 
 # ============================================================
@@ -1374,16 +1327,15 @@ async def asyncio_sleep(seconds):
 # ============================================================
 
 def start_health_server():
-    """
-    Render needs an HTTP listener for a Web Service.
-    """
 
     from http.server import (
         BaseHTTPRequestHandler,
         HTTPServer,
     )
 
-    class HealthHandler(BaseHTTPRequestHandler):
+    class HealthHandler(
+        BaseHTTPRequestHandler
+    ):
 
         def do_GET(self):
 
@@ -1421,18 +1373,16 @@ def start_health_server():
 
 
 # ============================================================
-# APPLICATION STARTUP
+# STARTUP
 # ============================================================
 
 async def post_init(application):
 
-    # Start Render health server.
     threading.Thread(
         target=start_health_server,
         daemon=True,
     ).start()
 
-    # Start event monitor.
     application.create_task(
         monitor_events(application)
     )
@@ -1461,7 +1411,6 @@ def main():
         .build()
     )
 
-    # Commands.
     application.add_handler(
         CommandHandler(
             "start",
