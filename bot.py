@@ -113,62 +113,46 @@ async def debug_command(
     try:
         data = get_calendar(14)
 
-        if isinstance(data, dict):
+        groups = data.get("data", [])
 
-            events = extract_events(data)
+        lines = [
+            "🔎 QUANTGIST DEBUG 2",
+            "",
+            f"Groups: {len(groups)}",
+        ]
 
-            lines = [
-                "🔎 QUANTGIST DEBUG",
-                "",
-                f"Response type: {type(data).__name__}",
-                f"Top-level keys: {list(data.keys())}",
-                f"Events extracted: {len(events)}",
-            ]
+        if groups:
+            group = groups[0]
 
-            if events:
+            lines.append(
+                f"First group: {group.get('alias')}"
+            )
+            lines.append(
+                f"Label: {group.get('label')}"
+            )
+            lines.append(
+                f"Country: {group.get('country')}"
+            )
+            lines.append(
+                f"Event count: {group.get('count')}"
+            )
 
-                first = events[0]
+            nested_events = group.get("data", [])
+
+            lines.append(
+                f"Nested events: {len(nested_events)}"
+            )
+
+            if nested_events:
+                event = nested_events[0]
 
                 lines.append("")
-                lines.append("FIRST EVENT")
+                lines.append("FIRST ACTUAL EVENT")
                 lines.append(
-                    f"Event keys: {list(first.keys())}"
+                    f"Keys: {list(event.keys())}"
                 )
 
-                # Only show useful event fields
-                safe_fields = [
-                    "id",
-                    "title",
-                    "event_type",
-                    "currency",
-                    "country",
-                    "impact",
-                    "release_time",
-                    "date",
-                    "time",
-                    "actual",
-                    "forecast",
-                    "previous",
-                    "is_released",
-                    "has_actual",
-                    "has_forecast",
-                    "missing_fields",
-                ]
-
-                for key in safe_fields:
-                    if key in first:
-                        lines.append(
-                            f"{key}: {first.get(key)}"
-                        )
-
-            else:
-                lines.append("")
-                lines.append(
-                    "⚠️ No events were extracted."
-                )
-
-                # Show safe top-level information
-                for key, value in data.items():
+                for key, value in event.items():
 
                     if key.lower() in {
                         "api_key",
@@ -180,24 +164,13 @@ async def debug_command(
                     }:
                         continue
 
-                    if isinstance(value, (str, int, float, bool)):
-                        lines.append(
-                            f"{key}: {value}"
-                        )
+                    lines.append(
+                        f"{key}: {value}"
+                    )
 
-            message = "\n".join(lines)
-
-            await update.message.reply_text(
-                message[:4000]
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "🔎 QUANTGIST DEBUG\n\n"
-                f"Response type: {type(data).__name__}\n"
-                f"Response: {str(data)[:3000]}"
-            )
+        await update.message.reply_text(
+            "\n".join(lines)[:4000]
+        )
 
     except requests.HTTPError as exc:
 
@@ -224,9 +197,7 @@ async def debug_command(
         await update.message.reply_text(
             "❌ DEBUG ERROR\n\n"
             f"{type(exc).__name__}: {exc}"
-        )
-
-
+            )
 # =========================
 # START
 # =========================
