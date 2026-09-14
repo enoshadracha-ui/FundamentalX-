@@ -9,23 +9,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 
-# =========================
-# ENVIRONMENT VARIABLES
-# =========================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SIFTING_API_KEY = os.getenv("SIFTING_API_KEY")
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-
-if not SIFTING_API_KEY:
-    raise RuntimeError("SIFTING_API_KEY is missing")
-
-
-# =========================
-# SIFTINGIO
-# =========================
 
 SIFTING_URL = "https://api.sifting.io/v1/fnd/economic-calendar"
 
@@ -35,18 +24,472 @@ HEADERS = {
 }
 
 
-def get_calendar(from_date=None, to_date=None, limit=100):
+# ============================================================
+# EVENT ANALYSIS KNOWLEDGE
+# ============================================================
+
+EVENT_ANALYSIS = {
+
+    "FOMC Rate Decision": {
+        "what": (
+            "The Federal Open Market Committee decides the target range "
+            "for the US federal funds rate and communicates its view on "
+            "economic conditions and monetary policy."
+        ),
+        "why": (
+            "Interest-rate decisions can significantly change expectations "
+            "for US monetary policy and therefore influence the US dollar, "
+            "Treasury yields and broader financial markets."
+        ),
+        "watch": (
+            "The market watches the rate decision, policy statement, "
+            "economic projections and the tone of the Federal Reserve."
+        ),
+        "above": (
+            "A more hawkish-than-expected decision or guidance can increase "
+            "expectations for tighter monetary policy."
+        ),
+        "below": (
+            "A more dovish-than-expected decision or guidance can increase "
+            "expectations for easier monetary policy."
+        ),
+        "inline": (
+            "If the decision broadly matches expectations, the reaction may "
+            "depend more heavily on the statement and forward guidance."
+        ),
+    },
+
+    "FOMC Minutes": {
+        "what": (
+            "The FOMC Minutes provide additional detail about the discussion "
+            "and reasoning behind a previous Federal Reserve policy meeting."
+        ),
+        "why": (
+            "They can reveal how policymakers viewed inflation, employment, "
+            "growth and the future path of interest rates."
+        ),
+        "watch": (
+            "Markets focus on changes in the balance between hawkish and "
+            "dovish views among policymakers."
+        ),
+        "above": (
+            "More hawkish discussion than previously expected can strengthen "
+            "expectations for tighter policy."
+        ),
+        "below": (
+            "More dovish discussion can strengthen expectations for easier "
+            "policy."
+        ),
+        "inline": (
+            "If the minutes largely confirm what markets already expected, "
+            "the reaction may be limited."
+        ),
+    },
+
+    "CPI": {
+        "what": (
+            "The Consumer Price Index measures changes in the prices paid "
+            "by consumers for a basket of goods and services."
+        ),
+        "why": (
+            "CPI is an important measure of inflation and can influence "
+            "expectations about central-bank policy."
+        ),
+        "watch": (
+            "Markets compare the actual inflation reading with the previous "
+            "reading and the expected/consensus reading."
+        ),
+        "above": (
+            "Higher-than-expected inflation generally indicates stronger "
+            "price pressure and may increase expectations for tighter policy."
+        ),
+        "below": (
+            "Lower-than-expected inflation generally indicates weaker price "
+            "pressure and may increase expectations for easier policy."
+        ),
+        "inline": (
+            "A result close to expectations may produce a smaller reaction "
+            "unless other details are significant."
+        ),
+    },
+
+    "PCE": {
+        "what": (
+            "The Personal Consumption Expenditures Price Index measures "
+            "changes in prices paid for goods and services consumed by "
+            "households."
+        ),
+        "why": (
+            "PCE inflation is closely watched by the Federal Reserve when "
+            "assessing inflation conditions."
+        ),
+        "watch": (
+            "Markets pay particular attention to the core PCE measure, "
+            "which excludes food and energy."
+        ),
+        "above": (
+            "Stronger-than-expected PCE inflation can increase expectations "
+            "for tighter monetary policy."
+        ),
+        "below": (
+            "Softer-than-expected PCE inflation can increase expectations "
+            "for easier monetary policy."
+        ),
+        "inline": (
+            "A result close to expectations may cause a more limited reaction "
+            "unless the details change the policy outlook."
+        ),
+    },
+
+    "Nonfarm Payrolls": {
+        "what": (
+            "Nonfarm Payrolls measures the monthly change in employment "
+            "across much of the US economy, excluding certain categories "
+            "such as farm workers."
+        ),
+        "why": (
+            "It is one of the most closely watched indicators of US labor "
+            "market conditions."
+        ),
+        "watch": (
+            "Markets compare the employment change with expectations and "
+            "also examine wages, unemployment and revisions."
+        ),
+        "above": (
+            "Stronger-than-expected payroll growth generally signals a "
+            "stronger labor market and can increase expectations for tighter "
+            "monetary policy."
+        ),
+        "below": (
+            "Weaker-than-expected payroll growth generally signals softer "
+            "labor-market conditions and can increase expectations for "
+            "easier monetary policy."
+        ),
+        "inline": (
+            "If payrolls are close to expectations, wages, unemployment and "
+            "revisions can determine the broader interpretation."
+        ),
+    },
+
+    "Unemployment Rate": {
+        "what": (
+            "The unemployment rate measures the percentage of the labor "
+            "force that is unemployed and actively seeking work."
+        ),
+        "why": (
+            "It provides an important indication of labor-market strength "
+            "and economic conditions."
+        ),
+        "watch": (
+            "Markets compare the actual unemployment rate with the previous "
+            "reading and expectations."
+        ),
+        "above": (
+            "A higher-than-expected unemployment rate generally signals "
+            "weaker labor-market conditions."
+        ),
+        "below": (
+            "A lower-than-expected unemployment rate generally signals "
+            "stronger labor-market conditions."
+        ),
+        "inline": (
+            "A reading close to expectations may leave the broader policy "
+            "outlook largely unchanged."
+        ),
+    },
+
+    "GDP": {
+        "what": (
+            "Gross Domestic Product measures the value of goods and services "
+            "produced by an economy."
+        ),
+        "why": (
+            "GDP provides a broad measure of economic growth and activity."
+        ),
+        "watch": (
+            "Markets compare the growth rate with previous readings and "
+            "economic expectations."
+        ),
+        "above": (
+            "Stronger-than-expected growth generally indicates stronger "
+            "economic activity."
+        ),
+        "below": (
+            "Weaker-than-expected growth generally indicates softer "
+            "economic activity."
+        ),
+        "inline": (
+            "Growth close to expectations may have a smaller immediate "
+            "effect unless the underlying components are surprising."
+        ),
+    },
+
+    "Retail Sales": {
+        "what": (
+            "Retail Sales measures changes in the value of sales made by "
+            "retail businesses."
+        ),
+        "why": (
+            "Consumer spending is an important component of economic "
+            "activity, making retail sales a useful growth indicator."
+        ),
+        "watch": (
+            "Markets compare the actual result with expectations and examine "
+            "the strength of consumer demand."
+        ),
+        "above": (
+            "Stronger-than-expected retail sales generally indicate stronger "
+            "consumer spending."
+        ),
+        "below": (
+            "Weaker-than-expected retail sales generally indicate softer "
+            "consumer spending."
+        ),
+        "inline": (
+            "A result close to expectations may produce a more limited "
+            "reaction."
+        ),
+    },
+
+    "PPI": {
+        "what": (
+            "The Producer Price Index measures changes in prices received "
+            "by producers for goods and services."
+        ),
+        "why": (
+            "Producer-price changes can provide information about inflation "
+            "pressures earlier in the supply chain."
+        ),
+        "watch": (
+            "Markets compare the result with expectations and examine "
+            "whether producer-price pressures are accelerating or easing."
+        ),
+        "above": (
+            "Higher-than-expected producer inflation can indicate stronger "
+            "upstream price pressure."
+        ),
+        "below": (
+            "Lower-than-expected producer inflation can indicate easing "
+            "upstream price pressure."
+        ),
+        "inline": (
+            "A result near expectations may have a smaller immediate impact."
+        ),
+    },
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_event_analysis(event_name):
+    """
+    Finds the best analysis profile for an event.
+    """
+
+    if event_name in EVENT_ANALYSIS:
+        return EVENT_ANALYSIS[event_name]
+
+    name = event_name.lower()
+
+    keyword_map = [
+        ("cpi", "CPI"),
+        ("consumer price", "CPI"),
+        ("pce", "PCE"),
+        ("personal consumption", "PCE"),
+        ("nonfarm", "Nonfarm Payrolls"),
+        ("payroll", "Nonfarm Payrolls"),
+        ("unemployment", "Unemployment Rate"),
+        ("jobless rate", "Unemployment Rate"),
+        ("gdp", "GDP"),
+        ("gross domestic", "GDP"),
+        ("retail sales", "Retail Sales"),
+        ("ppi", "PPI"),
+        ("producer price", "PPI"),
+        ("fomc minutes", "FOMC Minutes"),
+        ("fomc", "FOMC Rate Decision"),
+    ]
+
+    for keyword, profile in keyword_map:
+        if keyword in name:
+            return EVENT_ANALYSIS[profile]
+
+    return {
+        "what": (
+            "This is an economic indicator or policy-related event that "
+            "can provide information about economic conditions."
+        ),
+        "why": (
+            "Markets monitor the release because changes in economic "
+            "conditions can influence expectations for monetary policy."
+        ),
+        "watch": (
+            "Markets generally compare the actual release with the previous "
+            "reading and the expected/consensus value."
+        ),
+        "above": (
+            "A stronger-than-expected result may change expectations "
+            "depending on what the indicator measures."
+        ),
+        "below": (
+            "A weaker-than-expected result may change expectations "
+            "depending on what the indicator measures."
+        ),
+        "inline": (
+            "If the result is close to expectations, the market may focus "
+            "more heavily on the details and wider economic context."
+        ),
+    }
+
+
+def format_value(value):
+    """
+    Safely formats economic values without inventing missing data.
+    """
+
+    if value is None:
+        return "Not available"
+
+    if isinstance(value, str) and not value.strip():
+        return "Not available"
+
+    return str(value)
+
+
+def parse_datetime(value):
+    """
+    Converts SiftingIO timestamps into a readable UTC time.
+    """
+
+    if not value:
+        return "Time unavailable"
+
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        dt = dt.astimezone(timezone.utc)
+
+        return dt.strftime("%d %b %Y, %H:%M UTC")
+
+    except Exception:
+        return str(value)
+
+
+def build_analysis(event):
+    """
+    Builds the educational fundamental analysis for one event.
+    """
+
+    name = event.get("name", "Unknown event")
+    analysis = get_event_analysis(name)
+
+    previous = event.get("previous")
+    forecast = event.get("consensus")
+    actual = event.get("actual")
+
+    previous_text = format_value(previous)
+    forecast_text = format_value(forecast)
+    actual_text = format_value(actual)
+
+    result_section = ""
+
+    # --------------------------------------------------------
+    # RELEASED DATA ANALYSIS
+    # --------------------------------------------------------
+
+    if actual is not None and forecast is not None:
+
+        try:
+            actual_num = float(actual)
+            forecast_num = float(forecast)
+
+            if actual_num > forecast_num:
+                result_section = (
+                    "📊 **Result:** Above expectations\n\n"
+                    f"{analysis['above']}"
+                )
+
+            elif actual_num < forecast_num:
+                result_section = (
+                    "📊 **Result:** Below expectations\n\n"
+                    f"{analysis['below']}"
+                )
+
+            else:
+                result_section = (
+                    "📊 **Result:** In line with expectations\n\n"
+                    f"{analysis['inline']}"
+                )
+
+        except (ValueError, TypeError):
+
+            result_section = (
+                "📊 **Result:** Actual and forecast are available, "
+                "but they could not be compared automatically.\n\n"
+                f"{analysis['inline']}"
+            )
+
+    # --------------------------------------------------------
+    # PRE-RELEASE ANALYSIS
+    # --------------------------------------------------------
+
+    else:
+
+        result_section = (
+            "📊 **Before the release**\n\n"
+            "The actual result is not available yet. "
+            "The key comparison after release will be the Actual result "
+            "versus the Forecast/Consensus, alongside the Previous reading."
+        )
+
+    return (
+        f"📌 **{name}**\n\n"
+
+        f"📚 **What it is**\n"
+        f"{analysis['what']}\n\n"
+
+        f"🎯 **Why it matters**\n"
+        f"{analysis['why']}\n\n"
+
+        f"👀 **What markets watch**\n"
+        f"{analysis['watch']}\n\n"
+
+        f"📈 **Previous:** {previous_text}\n"
+        f"🔮 **Forecast:** {forecast_text}\n"
+        f"📊 **Actual:** {actual_text}\n\n"
+
+        f"{result_section}\n\n"
+
+        "⚠️ **Context matters:** Economic releases do not guarantee a "
+        "specific market reaction. Markets can also react to positioning, "
+        "other economic data, central-bank communication and information "
+        "already priced into the market."
+    )
+
+
+# ============================================================
+# SIFTINGIO CALENDAR
+# ============================================================
+
+def get_calendar(start_date=None, end_date=None, impact="high", limit=50):
+
+    if not SIFTING_API_KEY:
+        raise RuntimeError("SIFTING_API_KEY is not configured.")
 
     params = {
-        "impact": "high",
+        "impact": impact,
         "limit": limit,
     }
 
-    if from_date:
-        params["from"] = from_date
+    if start_date:
+        params["from"] = start_date
 
-    if to_date:
-        params["to"] = to_date
+    if end_date:
+        params["to"] = end_date
 
     response = requests.get(
         SIFTING_URL,
@@ -55,336 +498,232 @@ def get_calendar(from_date=None, to_date=None, limit=100):
         timeout=30,
     )
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"SiftingIO HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
+    response.raise_for_status()
 
     data = response.json()
 
-    return data.get("events", data.get("data", []))
+    if isinstance(data, dict):
+        if "data" in data:
+            return data["data"]
+
+        if "events" in data:
+            return data["events"]
+
+    if isinstance(data, list):
+        return data
+
+    return []
 
 
-# =========================
-# HELPERS
-# =========================
+# ============================================================
+# EVENT FORMATTER
+# ============================================================
 
-def value_or_unavailable(value):
+def format_event(event, include_analysis=False):
 
-    if value is None or value == "":
-        return "Not available"
+    name = event.get("name", "Unknown event")
+    currency = event.get("currency") or "N/A"
+    impact = event.get("impact") or "N/A"
+    agency = event.get("agency") or "N/A"
+    scheduled = parse_datetime(event.get("scheduled_at"))
 
-    return str(value)
-
-
-def event_time(event):
-
-    scheduled = event.get("scheduled_at")
-
-    if not scheduled:
-        return "Time not available"
-
-    try:
-        dt = datetime.fromisoformat(
-            scheduled.replace("Z", "+00:00")
-        )
-
-        return dt.strftime("%d %b %Y • %H:%M UTC")
-
-    except Exception:
-        return str(scheduled)
-
-
-# =========================
-# FUNDAMENTAL EXPLANATIONS
-# =========================
-
-def explain_event(name):
-
-    name_lower = name.lower()
-
-    if "fomc rate" in name_lower:
-
-        return (
-            "🏦 <b>Why it matters</b>\n"
-            "The FOMC decision shows the Federal Reserve's view "
-            "of interest rates and monetary policy.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "The rate decision, policy statement and guidance about "
-            "future monetary policy.\n\n"
-            "📈 <b>Possible market scenarios</b>\n"
-            "• More hawkish than expected → USD and yields may strengthen.\n"
-            "• More dovish than expected → USD and yields may weaken.\n"
-            "• In-line decision → the statement and forward guidance "
-            "can become the main driver."
-        )
-
-    if "fomc minutes" in name_lower:
-
-        return (
-            "🏦 <b>Why it matters</b>\n"
-            "FOMC minutes provide additional detail about the Fed's "
-            "discussion and policy outlook.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Whether policymakers appear more hawkish or dovish "
-            "than previously expected."
-        )
-
-    if "nonfarm payroll" in name_lower:
-
-        return (
-            "👷 <b>Why it matters</b>\n"
-            "Nonfarm Payrolls measure changes in employment outside "
-            "the farming sector and are one of the most closely "
-            "watched US labour-market releases.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Payroll growth, unemployment and wage-related data.\n\n"
-            "📈 <b>Possible market scenarios</b>\n"
-            "• Stronger labour data → may support USD and higher yields.\n"
-            "• Weaker labour data → may pressure USD and yields.\n"
-            "• Mixed data → market reaction can depend on the details."
-        )
-
-    if "unemployment rate" in name_lower:
-
-        return (
-            "👷 <b>Why it matters</b>\n"
-            "The unemployment rate provides a key view of US labour "
-            "market conditions.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Whether employment conditions are improving or weakening "
-            "relative to expectations."
-        )
-
-    if "cpi" in name_lower:
-
-        return (
-            "📊 <b>Why it matters</b>\n"
-            "CPI measures changes in consumer prices and is an important "
-            "indicator of inflation.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Whether inflation is accelerating or cooling and what that "
-            "could imply for monetary policy."
-        )
-
-    if "pce" in name_lower:
-
-        return (
-            "📊 <b>Why it matters</b>\n"
-            "PCE is an important US inflation measure closely watched "
-            "by the Federal Reserve.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Whether inflation is moving toward or away from the Fed's "
-            "preferred direction."
-        )
-
-    if "gdp" in name_lower:
-
-        return (
-            "🏭 <b>Why it matters</b>\n"
-            "GDP measures the overall growth of economic activity.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Whether economic growth is accelerating or slowing."
-        )
-
-    if "retail sales" in name_lower:
-
-        return (
-            "🛍 <b>Why it matters</b>\n"
-            "Retail Sales provide information about consumer spending "
-            "and economic activity.\n\n"
-            "📌 <b>What markets watch</b>\n"
-            "Strength or weakness in consumer demand."
-        )
-
-    return (
-        "📊 <b>Why it matters</b>\n"
-        "This is a high-impact economic release that can influence "
-        "expectations for economic growth, inflation or monetary policy.\n\n"
-        "📌 <b>What markets watch</b>\n"
-        "The actual result, expectations and the wider macroeconomic "
-        "context."
-    )
-
-
-def format_event(event):
-
-    name = value_or_unavailable(event.get("name"))
-    currency = value_or_unavailable(event.get("currency"))
-    impact = value_or_unavailable(event.get("impact")).upper()
-    agency = value_or_unavailable(event.get("agency"))
-
-    previous = value_or_unavailable(event.get("previous"))
-    forecast = value_or_unavailable(event.get("consensus"))
-    actual = value_or_unavailable(event.get("actual"))
-
-    message = (
-        f"🔴 <b>{name}</b>\n\n"
+    text = (
+        f"🔴 **{name}**\n"
         f"💵 Currency: {currency}\n"
-        f"🔥 Impact: {impact}\n"
+        f"⚠️ Impact: {impact}\n"
         f"🏛 Agency: {agency}\n"
-        f"🕐 Scheduled: {event_time(event)}\n\n"
-        f"<b>Previous:</b> {previous}\n"
-        f"<b>Forecast:</b> {forecast}\n"
-        f"<b>Actual:</b> {actual}\n\n"
+        f"🕒 Scheduled: {scheduled}\n\n"
+        f"Previous: {format_value(event.get('previous'))}\n"
+        f"Forecast: {format_value(event.get('consensus'))}\n"
+        f"Actual: {format_value(event.get('actual'))}"
     )
 
-    message += explain_event(name)
+    if include_analysis:
+        text += "\n\n" + build_analysis(event)
 
-    return message
+    return text
 
 
-# =========================
+# ============================================================
 # /START
-# =========================
+# ============================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = (
-        "👋 <b>Welcome to FundamentalX</b>\n\n"
-        "Your economic-news and fundamental-analysis assistant.\n\n"
+        "👋 **Welcome to FundamentalX**\n\n"
+
+        "FundamentalX monitors major economic events and explains "
+        "what they mean from a fundamental perspective.\n\n"
+
         "📅 /today — Today's high-impact events\n"
-        "🔜 /next — Upcoming high-impact events\n\n"
-        "FundamentalX currently monitors major US economic "
-        "releases including FOMC, NFP, GDP, PCE and more.\n\n"
-        "⚠️ FundamentalX provides educational market context "
-        "and scenario analysis, not personalized financial advice."
+        "⏭ /next — Upcoming high-impact events\n\n"
+
+        "The analysis is educational and focuses on economic data, "
+        "expectations and possible market implications."
     )
 
     await update.message.reply_text(
         message,
-        parse_mode="HTML"
+        parse_mode="Markdown"
     )
 
 
-# =========================
+# ============================================================
 # /TODAY
-# =========================
+# ============================================================
 
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🔎 Checking today's high-impact economic events..."
-    )
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
 
         now = datetime.now(timezone.utc)
 
-        today_date = now.strftime("%Y-%m-%d")
-        tomorrow_date = (
-            now + timedelta(days=1)
-        ).strftime("%Y-%m-%d")
+        today = now.strftime("%Y-%m-%d")
+        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
         events = get_calendar(
-            from_date=today_date,
-            to_date=tomorrow_date,
-            limit=100
+            start_date=today,
+            end_date=tomorrow,
+            impact="high",
+            limit=50,
         )
-
-        today_events = []
-
-        for event in events:
-
-            scheduled = event.get("scheduled_at", "")
-
-            if scheduled.startswith(today_date):
-                today_events.append(event)
-
-        if not today_events:
-
-            await update.message.reply_text(
-                "📅 No high-impact US economic events "
-                "found for today."
-            )
-
-            return
-
-        message = (
-            f"🔴 <b>Today's High-Impact Events</b>\n"
-            f"📅 {today_date}\n\n"
-        )
-
-        for event in today_events:
-
-            message += format_event(event)
-            message += "\n\n──────────────\n\n"
-
-        await update.message.reply_text(
-            message,
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-
-        print(f"/today error: {e}")
-
-        await update.message.reply_text(
-            "❌ I couldn't retrieve today's calendar.\n\n"
-            "Check the Render logs for the exact error."
-        )
-
-
-# =========================
-# /NEXT
-# =========================
-
-async def next_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "🔎 Checking upcoming high-impact events..."
-    )
-
-    try:
-
-        events = get_calendar(limit=10)
 
         if not events:
 
             await update.message.reply_text(
-                "📅 No upcoming high-impact events found."
+                "📅 No high-impact US economic events found for today."
             )
 
             return
 
-        message = (
-            "🔜 <b>Upcoming High-Impact Events</b>\n\n"
+        message_parts = [
+            "📅 **TODAY'S HIGH-IMPACT EVENTS**\n"
+        ]
+
+        for event in events:
+
+            message_parts.append(
+                format_event(
+                    event,
+                    include_analysis=True
+                )
+            )
+
+        message = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(
+            message_parts
         )
 
-        for event in events[:10]:
-
-            message += format_event(event)
-            message += "\n\n──────────────\n\n"
-
         await update.message.reply_text(
-            message,
-            parse_mode="HTML"
+            message[:4000],
+            parse_mode="Markdown"
         )
 
     except Exception as e:
 
-        print(f"/next error: {e}")
+        print("TODAY ERROR:", e)
 
         await update.message.reply_text(
-            "❌ I couldn't retrieve upcoming events.\n\n"
-            "Check the Render logs for the exact error."
+            "❌ I couldn't retrieve today's economic calendar right now."
         )
 
 
-# =========================
-# RENDER HEALTH SERVER
-# =========================
+# ============================================================
+# /NEXT
+# ============================================================
+
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    try:
+
+        now = datetime.now(timezone.utc)
+
+        start_date = now.strftime("%Y-%m-%d")
+        end_date = (now + timedelta(days=30)).strftime("%Y-%m-%d")
+
+        events = get_calendar(
+            start_date=start_date,
+            end_date=end_date,
+            impact="high",
+            limit=50,
+        )
+
+        if not events:
+
+            await update.message.reply_text(
+                "📅 No upcoming high-impact US economic events were found."
+            )
+
+            return
+
+        # Sort by scheduled release time
+        events = sorted(
+            events,
+            key=lambda x: x.get("scheduled_at") or ""
+        )
+
+        message_parts = [
+            "⏭ **UPCOMING HIGH-IMPACT EVENTS**\n"
+        ]
+
+        for event in events:
+
+            message_parts.append(
+                format_event(
+                    event,
+                    include_analysis=True
+                )
+            )
+
+        message = "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(
+            message_parts
+        )
+
+        # Telegram messages have a size limit.
+        # Send in chunks.
+        chunks = []
+
+        while len(message) > 3900:
+
+            split_at = message.rfind(
+                "\n\n━━━━━━━━━━━━━━━━━━\n\n",
+                0,
+                3900
+            )
+
+            if split_at == -1:
+                split_at = 3900
+
+            chunks.append(message[:split_at])
+            message = message[split_at:]
+
+        chunks.append(message)
+
+        for chunk in chunks:
+
+            await update.message.reply_text(
+                chunk,
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+
+        print("NEXT ERROR:", e)
+
+        await update.message.reply_text(
+            "❌ I couldn't retrieve the upcoming economic calendar right now."
+        )
+
+
+# ============================================================
+# HEALTH CHECK FOR RENDER
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain"
-        )
         self.end_headers()
 
         self.wfile.write(
@@ -395,10 +734,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_health_server():
+def run_health_server():
 
     port = int(
-        os.getenv("PORT", "10000")
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
     )
 
     server = HTTPServer(
@@ -413,40 +755,62 @@ def start_health_server():
     server.serve_forever()
 
 
-# =========================
+# ============================================================
 # MAIN
-# =========================
+# ============================================================
 
 def main():
 
-    print("Starting FundamentalX...")
+    if not TELEGRAM_BOT_TOKEN:
 
-    threading.Thread(
-        target=start_health_server,
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not configured."
+        )
+
+    if not SIFTING_API_KEY:
+
+        raise RuntimeError(
+            "SIFTING_API_KEY is not configured."
+        )
+
+    # Start Render health server
+    health_thread = threading.Thread(
+        target=run_health_server,
         daemon=True
-    ).start()
+    )
 
+    health_thread.start()
+
+    # Build Telegram application
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .build()
     )
 
+    # Commands
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("today", today)
+        CommandHandler(
+            "today",
+            today_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("next", next_events)
+        CommandHandler(
+            "next",
+            next_command
+        )
     )
 
-    print(
-        "FundamentalX Telegram bot is running."
-    )
+    print("FundamentalX starting...")
 
     application.run_polling(
         drop_pending_updates=True
