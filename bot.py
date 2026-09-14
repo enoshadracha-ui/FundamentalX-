@@ -1,8 +1,8 @@
 import os
-import requests
+import threading
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -14,147 +14,190 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 QUANTGIST_API_KEY = os.getenv("QUANTGIST_API_KEY")
 
-QUANTGIST_URL = "https://api.quantgist.com/v1/macro/calendar"
+CALENDAR_URL = "https://api.quantgist.com/v1/macro/calendar"
+EVENT_DETAIL_URL = "https://api.quantgist.com/v2/events"
 
 EVENT_ALIASES = (
     "NFP,CPI,PCE,FOMC,GDP,UNEMPLOYMENT,"
     "RETAIL_SALES,PPI,ISM"
 )
 
-# 30 days gives /next enough room to find upcoming events.
 CALENDAR_DAYS = 30
 
 
 # ============================================================
-# BASIC HELPERS
+# QUANTGIST HELPERS
 # ============================================================
 
-def parse_datetime(value):
-    if not value:
-        return None
-
-    try:
-        value = str(value).strip()
-
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-
-        dt = datetime.fromisoformat(value)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.astimezone(timezone.utc)
-
-    except Exception:
-        return None
-
-
-def display_value(value):
-    if value is None:
-        return "Not available"
-
-    if isinstance(value, str):
-        value = value.strip()
-
-        if not value or value.lower() in {"none", "null", "n/a"}:
-            return "Not available"
-
-        return value
-
-    return str(value)
-
-
-def is_high_impact(event):
-    return str(event.get("impact", "")).lower() == "high"
-
-
-def event_time(event):
-    return parse_datetime(event.get("release_time"))
-
-
-# ============================================================
-# QUANTGIST API
-# ============================================================
-
-def get_calendar(days=CALENDAR_DAYS):
-    if not QUANTGIST_API_KEY:
-        raise RuntimeError("QUANTGIST_API_KEY is missing.")
-
-    headers = {
+def get_headers():
+    return {
         "X-API-Key": QUANTGIST_API_KEY
     }
 
-    params = {
-        "events": EVENT_ALIASES,
-        "days": days
-    }
 
+def get_calendar():
     response = requests.get(
-        QUANTGIST_URL,
-        headers=headers,
-        params=params,
+        CALENDAR_URL,
+        headers=get_headers(),
+        params={
+            "events": EVENT_ALIASES,
+            "days": CALENDAR_DAYS
+        },
         timeout=30
     )
 
     response.raise_for_status()
-
     return response.json()
 
 
-# ============================================================
-# IMPORTANT:
-# QuantGist returns:
-#
-# data
-#   -> groups
-#       -> group["data"]
-#           -> actual event records
-#
-# ============================================================
+def get_event_detail(event_id):
+    """
+    QuantGist v2:
+    GET /v2/events/{event_id}
 
-def flatten_calendar(response_data):
+    Used when the calendar record does not contain
+    previous/forecast/actual.
+    """
+
+    if not event_id:
+        return {}
+
+    url = f"{EVENT_DETAIL_URL}/{event_id}"
+
+    response = requests.get(
+        url,
+        headers=get_headers(),
+        timeout=20
+    )
+
+    if response.status_code != 200:
+        print(
+            "DETAIL ERROR:",
+            response.status_code,
+            response.text[:500]
+        )
+        return {}
+
+    data = response.json()
+
+    if isinstance(data, dict):
+        return data
+
+    return {}
+
+
+def enrich_event(event):
+    """
+    Keep the calendar event, but retrieve the detailed
+    event record when values are missing.
+    """
+
+    needs_detail = any(
+        event.get(field) is None
+        for field in (
+            "previous",
+            "forecast",
+            "actual"
+        )
+    )
+
+    if not needs_detail:
+        return event
+
+    event_id = event.get("id")
+
+    if not event_id:
+        return event
+
+    detail = get_event_detail(event_id)
+
+    if not detail:
+        return event
+
+    # Keep calendar data if detail doesn't provide a value.
+    for field in (
+        "actual",
+        "forecast",
+        "previous",
+        "surprise_pct",
+        "impact",
+        "release_time",
+        "title",
+        "currency",
+        "symbols"
+    ):
+        if detail.get(field) is not None:
+            event[field] = detail[field]
+
+    return event
+
+
+def flatten_calendar(payload):
+    """
+    QuantGist calendar response contains groups:
+
+    data = [
+        {
+            alias: "...",
+            label: "...",
+            country: "...",
+            data: [...]
+        }
+    ]
+    """
+
     events = []
 
-    if not isinstance(response_data, dict):
-        return events
-
-    groups = response_data.get("data", [])
+    groups = payload.get("data", [])
 
     if not isinstance(groups, list):
         return events
 
     for group in groups:
+
         if not isinstance(group, dict):
             continue
 
-        nested_events = group.get("data", [])
+        group_events = group.get("data", [])
 
-        if isinstance(nested_events, list):
-            for event in nested_events:
-                if isinstance(event, dict):
-                    events.append(event)
+        if isinstance(group_events, list):
+            events.extend(group_events)
 
     return events
 
 
 # ============================================================
-# EVENT IDENTIFICATION
+# GENERAL HELPERS
 # ============================================================
 
+def parse_release_time(event):
+    value = event.get("release_time")
+
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+
+
+def format_value(value):
+    if value is None or value == "":
+        return "Not available"
+
+    return str(value)
+
+
 def identify_event_type(event):
-    text = " ".join([
-        str(event.get("event_type", "")),
-        str(event.get("title", "")),
-        str(event.get("title_normalized", "")),
-        str(event.get("canonical_id", "")),
-        str(event.get("source_event_id", ""))
-    ]).lower()
+    text = (
+        str(event.get("event_type", "")) + " " +
+        str(event.get("title", ""))
+    ).lower()
 
-    if "fomc" in text or "fed" in text:
-        return "FOMC"
-
-    if "non-farm" in text or "nonfarm" in text or "payroll" in text:
+    if "nonfarm" in text or "nfp" in text:
         return "NFP"
 
     if "consumer price" in text or "cpi" in text:
@@ -162,6 +205,9 @@ def identify_event_type(event):
 
     if "pce" in text:
         return "PCE"
+
+    if "fomc" in text or "rate decision" in text:
+        return "FOMC"
 
     if "unemployment" in text:
         return "UNEMPLOYMENT"
@@ -175,287 +221,102 @@ def identify_event_type(event):
     if "producer price" in text or "ppi" in text:
         return "PPI"
 
-    if "ism" in text or "manufacturing" in text or "services pmi" in text:
+    if "ism" in text:
         return "ISM"
 
-    return str(event.get("event_type", "MACRO")).upper()
+    return "MACRO"
 
 
 # ============================================================
-# EDUCATIONAL MACRO ANALYSIS
+# EDUCATIONAL ANALYSIS
 # ============================================================
 
-PROFILES = {
+def build_analysis(event):
 
-    "NFP": {
-        "what": "Measures changes in U.S. non-farm employment.",
-        "higher": (
-            "A stronger-than-expected result can indicate a stronger labor "
-            "market and may increase expectations for tighter U.S. monetary policy."
-        ),
-        "lower": (
-            "A weaker-than-expected result can indicate labor-market cooling "
-            "and may increase expectations for easier U.S. monetary policy."
-        ),
-    },
-
-    "CPI": {
-        "what": "Measures consumer-price inflation.",
-        "higher": (
-            "Higher-than-expected inflation can increase expectations that "
-            "the central bank may keep policy tighter for longer."
-        ),
-        "lower": (
-            "Lower-than-expected inflation can reduce pressure for restrictive "
-            "policy and may increase expectations for future easing."
-        ),
-    },
-
-    "PCE": {
-        "what": "Measures consumer inflation and is closely watched by the Federal Reserve.",
-        "higher": (
-            "A stronger inflation reading can reinforce expectations for "
-            "restrictive monetary policy."
-        ),
-        "lower": (
-            "A softer reading can reduce expectations for restrictive policy."
-        ),
-    },
-
-    "FOMC": {
-        "what": "Reports the Federal Reserve's monetary-policy decision.",
-        "higher": (
-            "A more hawkish-than-expected decision can support the U.S. dollar "
-            "and push U.S. yields higher."
-        ),
-        "lower": (
-            "A more dovish-than-expected decision can weigh on the U.S. dollar "
-            "and push U.S. yields lower."
-        ),
-    },
-
-    "UNEMPLOYMENT": {
-        "what": "Measures the percentage of the labor force that is unemployed.",
-        "higher": (
-            "A higher unemployment rate generally signals a softer labor market "
-            "and can increase expectations for easier policy."
-        ),
-        "lower": (
-            "A lower unemployment rate generally signals a stronger labor market "
-            "and can reduce expectations for easier policy."
-        ),
-    },
-
-    "GDP": {
-        "what": "Measures the growth of economic output.",
-        "higher": (
-            "Stronger growth can support expectations for a resilient economy "
-            "and potentially less need for monetary easing."
-        ),
-        "lower": (
-            "Weaker growth can increase concerns about economic slowdown "
-            "and potentially increase expectations for easier policy."
-        ),
-    },
-
-    "RETAIL_SALES": {
-        "what": "Measures consumer spending through retail activity.",
-        "higher": (
-            "Stronger consumer spending can signal stronger economic activity "
-            "and may support expectations for tighter policy."
-        ),
-        "lower": (
-            "Weaker consumer spending can signal economic cooling "
-            "and may support expectations for easier policy."
-        ),
-    },
-
-    "PPI": {
-        "what": "Measures changes in producer-level prices.",
-        "higher": (
-            "Higher producer inflation can increase concern about persistent "
-            "inflationary pressure."
-        ),
-        "lower": (
-            "Lower producer inflation can reduce concern about inflationary pressure."
-        ),
-    },
-
-    "ISM": {
-        "what": "Measures business activity through the ISM survey.",
-        "higher": (
-            "A stronger reading generally signals stronger business activity."
-        ),
-        "lower": (
-            "A weaker reading generally signals softer business activity."
-        ),
-    },
-}
-
-
-def build_analysis(event, released=False):
     event_type = identify_event_type(event)
-
-    profile = PROFILES.get(
-        event_type,
-        {
-            "what": "A major economic or monetary-policy release.",
-            "higher": (
-                "A stronger-than-expected result may indicate stronger "
-                "economic conditions."
-            ),
-            "lower": (
-                "A weaker-than-expected result may indicate softer "
-                "economic conditions."
-            ),
-        }
-    )
 
     actual = event.get("actual")
     forecast = event.get("forecast")
     previous = event.get("previous")
 
-    lines = []
-
-    lines.append(f"📊 *Fundamental Analysis — {event_type}*")
-    lines.append("")
-    lines.append(f"*What it measures:* {profile['what']}")
-    lines.append("")
-
-    lines.append(f"*Previous:* {display_value(previous)}")
-    lines.append(f"*Forecast:* {display_value(forecast)}")
-    lines.append(f"*Actual:* {display_value(actual)}")
-    lines.append("")
-
-    if released and actual is not None:
-
-        lines.append("📌 *Release assessment*")
-
-        if forecast is not None:
-            try:
-                actual_num = float(actual)
-                forecast_num = float(forecast)
-
-                if actual_num > forecast_num:
-                    lines.append("• Actual came in ABOVE forecast.")
-                    lines.append(f"• {profile['higher']}")
-
-                elif actual_num < forecast_num:
-                    lines.append("• Actual came in BELOW forecast.")
-                    lines.append(f"• {profile['lower']}")
-
-                else:
-                    lines.append("• Actual matched forecast.")
-                    lines.append(
-                        "• The release was broadly in line with expectations."
-                    )
-
-            except (ValueError, TypeError):
-                lines.append(
-                    "• Actual and forecast are available but are not "
-                    "simple numeric values for direct comparison."
-                )
-
-        else:
-            lines.append(
-                "• Actual is available, but no forecast was supplied "
-                "by the calendar."
-            )
-
-    else:
-
-        lines.append("🔮 *Before the release*")
-
-        if forecast is not None:
-            lines.append(
-                "• The market will compare the actual figure with the forecast."
-            )
-
-            lines.append(
-                f"• Above forecast: {profile['higher']}"
-            )
-
-            lines.append(
-                f"• Below forecast: {profile['lower']}"
-            )
-
-        else:
-            lines.append(
-                "• No forecast is currently available from the calendar."
-            )
-
-        lines.append(
-            "• The initial market reaction can change as traders "
-            "interpret the number alongside other economic data."
-        )
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# EVENT FORMAT
-# ============================================================
-
-def format_event(event, include_analysis=True):
-    title = event.get("title", "Economic Event")
-    country = event.get("country", "")
-    currency = event.get("currency", "")
-    impact = event.get("impact", "unknown")
-
-    dt = event_time(event)
-
-    if dt:
-        time_text = dt.strftime("%d %b %Y • %H:%M UTC")
-    else:
-        time_text = "Time unavailable"
-
-    released = bool(event.get("is_released"))
-    event_type = identify_event_type(event)
+    title = event.get(
+        "title",
+        "Economic Event"
+    )
 
     lines = [
-        f"📰 *{title}*",
-        f"Type: {event_type}",
-        f"Country: {country or 'N/A'}",
-        f"Currency: {currency or 'N/A'}",
-        f"Impact: {impact}",
-        f"Release: {time_text}",
-        f"Status: {'RELEASED' if released else 'UPCOMING'}",
+        f"📊 {title}",
         "",
-        f"Previous: {display_value(event.get('previous'))}",
-        f"Forecast: {display_value(event.get('forecast'))}",
-        f"Actual: {display_value(event.get('actual'))}",
+        f"Event Type: {event_type}",
+        f"Previous: {format_value(previous)}",
+        f"Forecast: {format_value(forecast)}",
+        f"Actual: {format_value(actual)}",
+        ""
     ]
 
-    if include_analysis:
-        lines.append("")
-        lines.append(build_analysis(event, released))
+    if actual is None:
+
+        lines.extend([
+            "🧠 BEFORE RELEASE",
+            "",
+            "The market will compare the new figure "
+            "with the previous result and the forecast.",
+            "",
+            "A meaningful surprise can change expectations "
+            "around inflation, growth, employment or "
+            "monetary policy.",
+            "",
+            "⚠️ This is educational scenario analysis, "
+            "not a guaranteed market direction."
+        ])
+
+    else:
+
+        lines.extend([
+            "🧠 AFTER RELEASE",
+            "",
+            "Compare Actual with Forecast first.",
+            "",
+            "A significant surprise may change expectations "
+            "for monetary policy and affect related markets.",
+            "",
+            "The broader macro context should also be considered."
+        ])
+
+        surprise = event.get("surprise_pct")
+
+        if surprise is not None:
+            lines.extend([
+                "",
+                f"Surprise: {surprise}%"
+            ])
 
     return "\n".join(lines)
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# /START
 # ============================================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     message = (
-        "👋 *Welcome to FundamentalX*\n\n"
-        "Your economic-calendar and macro-analysis assistant.\n\n"
+        "🤖 FundamentalX\n\n"
+        "Economic calendar + macro analysis assistant.\n\n"
         "Commands:\n"
-        "• /today — today's high-impact events\n"
-        "• /next — upcoming high-impact events\n\n"
-        "FundamentalX compares Previous, Forecast and Actual "
-        "and explains possible market reactions."
+        "/next - Upcoming high-impact events\n"
+        "/today - Today's high-impact events"
     )
 
-    await update.message.reply_text(
-        message,
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(message)
 
+
+# ============================================================
+# /NEXT
+# ============================================================
 
 async def next_command(
     update: Update,
@@ -463,80 +324,100 @@ async def next_command(
 ):
 
     try:
-        response_data = get_calendar(CALENDAR_DAYS)
-        events = flatten_calendar(response_data)
+
+        payload = get_calendar()
+
+        events = flatten_calendar(payload)
 
         now = datetime.now(timezone.utc)
 
         upcoming = []
 
         for event in events:
-            if not is_high_impact(event):
+
+            release_time = parse_release_time(event)
+
+            if not release_time:
                 continue
 
-            dt = event_time(event)
+            if release_time <= now:
+                continue
 
-            if dt and dt >= now:
-                upcoming.append(event)
+            if str(
+                event.get("impact", "")
+            ).lower() != "high":
+                continue
+
+            upcoming.append(
+                (release_time, event)
+            )
 
         upcoming.sort(
-            key=lambda event: event_time(event)
-            or datetime.max.replace(tzinfo=timezone.utc)
+            key=lambda item: item[0]
         )
 
         if not upcoming:
+
             await update.message.reply_text(
                 "📅 No upcoming high-impact events found."
             )
+
             return
 
-        # Show up to 8 upcoming events.
-        selected = upcoming[:8]
-
-        parts = [
-            "📅 *Upcoming High-Impact Events*",
+        lines = [
+            "📅 Upcoming High-Impact Events",
             ""
         ]
 
-        for index, event in enumerate(selected, start=1):
-            parts.append(
-                f"*{index}. {event.get('title', 'Economic Event')}*"
+        for index, (release_time, event) in enumerate(
+            upcoming[:8],
+            start=1
+        ):
+
+            # Get missing data from detailed endpoint.
+            event = enrich_event(event)
+
+            title = event.get(
+                "title",
+                "Economic Event"
             )
 
-            dt = event_time(event)
-
-            if dt:
-                parts.append(
-                    f"🕒 {dt.strftime('%d %b %Y • %H:%M UTC')}"
-                )
-
-            parts.append(
-                f"Impact: {event.get('impact', 'Unknown')}"
+            previous = format_value(
+                event.get("previous")
             )
 
-            parts.append(
-                f"Previous: {display_value(event.get('previous'))}"
+            forecast = format_value(
+                event.get("forecast")
             )
 
-            parts.append(
-                f"Forecast: {display_value(event.get('forecast'))}"
-            )
-
-            parts.append("")
+            lines.extend([
+                f"{index}. {title}",
+                (
+                    f"🕒 {release_time.strftime('%d %b %Y')} "
+                    f"• {release_time.strftime('%H:%M')} UTC"
+                ),
+                f"Impact: {event.get('impact', 'unknown')}",
+                f"Previous: {previous}",
+                f"Forecast: {forecast}",
+                ""
+            ])
 
         await update.message.reply_text(
-            "\n".join(parts),
-            parse_mode="Markdown"
+            "\n".join(lines)
         )
 
     except Exception as error:
 
-        print("NEXT ERROR:", repr(error))
+        print("NEXT ERROR:", error)
 
         await update.message.reply_text(
-            "⚠️ I couldn't retrieve the economic calendar right now."
+            "⚠️ Unable to retrieve the economic calendar."
         )
 
+
+# ============================================================
+# /TODAY
+# ============================================================
 
 async def today_command(
     update: Update,
@@ -544,73 +425,105 @@ async def today_command(
 ):
 
     try:
-        response_data = get_calendar(CALENDAR_DAYS)
-        events = flatten_calendar(response_data)
 
-        today = datetime.now(timezone.utc).date()
+        payload = get_calendar()
 
-        todays_events = []
+        events = flatten_calendar(payload)
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        found = []
 
         for event in events:
-            if not is_high_impact(event):
+
+            release_time = parse_release_time(event)
+
+            if not release_time:
                 continue
 
-            dt = event_time(event)
+            if release_time.date() != today:
+                continue
 
-            if dt and dt.date() == today:
-                todays_events.append(event)
+            if str(
+                event.get("impact", "")
+            ).lower() != "high":
+                continue
 
-        todays_events.sort(
-            key=lambda event: event_time(event)
-            or datetime.max.replace(tzinfo=timezone.utc)
+            found.append(
+                (release_time, event)
+            )
+
+        found.sort(
+            key=lambda item: item[0]
         )
 
-        if not todays_events:
+        if not found:
+
             await update.message.reply_text(
-                "📅 No high-impact events found for today."
+                "📅 No high-impact events scheduled today."
             )
+
             return
 
-        for event in todays_events:
+        for release_time, event in found:
+
+            event = enrich_event(event)
+
+            analysis = build_analysis(event)
+
+            header = (
+                f"🕒 {release_time.strftime('%H:%M')} UTC\n"
+                f"Impact: {event.get('impact', 'unknown')}\n\n"
+            )
+
             await update.message.reply_text(
-                format_event(event),
-                parse_mode="Markdown"
+                header + analysis
             )
 
     except Exception as error:
 
-        print("TODAY ERROR:", repr(error))
+        print("TODAY ERROR:", error)
 
         await update.message.reply_text(
-            "⚠️ I couldn't retrieve today's economic events."
+            "⚠️ Unable to retrieve today's events."
         )
 
 
 # ============================================================
-# HEALTH CHECK FOR RENDER
+# RENDER HEALTH SERVER
 # ============================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"FundamentalX is running.")
-
-    def log_message(self, format, *args):
-        return
-
-
 def run_health_server():
-    port = int(os.environ.get("PORT", "10000"))
+
+    from http.server import (
+        BaseHTTPRequestHandler,
+        HTTPServer
+    )
+
+    port = int(
+        os.getenv("PORT", "10000")
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def do_GET(self):
+
+            self.send_response(200)
+            self.end_headers()
+
+            self.wfile.write(
+                b"FundamentalX is running."
+            )
+
+        def log_message(self, format, *args):
+            return
 
     server = HTTPServer(
         ("0.0.0.0", port),
-        HealthHandler
+        Handler
     )
-
-    print(f"Health server running on port {port}")
 
     server.serve_forever()
 
@@ -623,22 +536,18 @@ def main():
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing from environment variables."
+            "TELEGRAM_BOT_TOKEN is missing."
         )
 
     if not QUANTGIST_API_KEY:
         raise RuntimeError(
-            "QUANTGIST_API_KEY is missing from environment variables."
+            "QUANTGIST_API_KEY is missing."
         )
 
-    import threading
-
-    health_thread = threading.Thread(
+    threading.Thread(
         target=run_health_server,
         daemon=True
-    )
-
-    health_thread.start()
+    ).start()
 
     application = (
         Application.builder()
@@ -647,22 +556,29 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start_command)
+        CommandHandler(
+            "start",
+            start_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("next", next_command)
+        CommandHandler(
+            "next",
+            next_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("today", today_command)
+        CommandHandler(
+            "today",
+            today_command
+        )
     )
 
-    print("FundamentalX Telegram bot starting...")
+    print("FundamentalX is running...")
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    application.run_polling()
 
 
 if __name__ == "__main__":
