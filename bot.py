@@ -105,56 +105,44 @@ def get_calendar(days=14):
 # =========================
 # DEBUG COMMAND
 # =========================
-
-async def debug_command(
+ async def debug_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     try:
         data = get_calendar(14)
-
         groups = data.get("data", [])
 
         lines = [
-            "🔎 QUANTGIST DEBUG 2",
+            "🔎 QUANTGIST DEBUG 3",
             "",
-            f"Groups: {len(groups)}",
+            f"Groups returned: {len(groups)}",
+            ""
         ]
 
-        if groups:
-            group = groups[0]
+        for group in groups:
+            alias = group.get("alias", "UNKNOWN")
+            label = group.get("label", "Unknown")
+            country = group.get("country", "Unknown")
+            count = group.get("count", 0)
+            nested = group.get("data", [])
 
             lines.append(
-                f"First group: {group.get('alias')}"
+                f"{alias} | {label} | {country}"
             )
             lines.append(
-                f"Label: {group.get('label')}"
-            )
-            lines.append(
-                f"Country: {group.get('country')}"
-            )
-            lines.append(
-                f"Event count: {group.get('count')}"
+                f"Count: {count} | Nested: {len(nested)}"
             )
 
-            nested_events = group.get("data", [])
+            if nested:
+                event = nested[0]
 
-            lines.append(
-                f"Nested events: {len(nested_events)}"
-            )
-
-            if nested_events:
-                event = nested_events[0]
-
-                lines.append("")
-                lines.append("FIRST ACTUAL EVENT")
                 lines.append(
-                    f"Keys: {list(event.keys())}"
+                    f"First event keys: {list(event.keys())}"
                 )
 
                 for key, value in event.items():
-
-                    if key.lower() in {
+                    if key.lower() not in {
                         "api_key",
                         "key",
                         "token",
@@ -162,11 +150,11 @@ async def debug_command(
                         "password",
                         "secret",
                     }:
-                        continue
+                        lines.append(
+                            f"{key}: {value}"
+                        )
 
-                    lines.append(
-                        f"{key}: {value}"
-                    )
+                lines.append("")
 
         await update.message.reply_text(
             "\n".join(lines)[:4000]
@@ -197,7 +185,7 @@ async def debug_command(
         await update.message.reply_text(
             "❌ DEBUG ERROR\n\n"
             f"{type(exc).__name__}: {exc}"
-            )
+                )
 # =========================
 # START
 # =========================
