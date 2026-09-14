@@ -1,20 +1,12 @@
 import os
-import time
 import threading
 import requests
-from datetime import datetime, timezone, timedelta
+
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =========================
-# ENVIRONMENT VARIABLES
-# =========================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 QUANTGIST_API_KEY = os.getenv("QUANTGIST_API_KEY")
@@ -22,20 +14,12 @@ QUANTGIST_API_KEY = os.getenv("QUANTGIST_API_KEY")
 QUANTGIST_BASE_URL = "https://api.quantgist.com/v1"
 
 
-# =========================
-# BASIC CHECKS
-# =========================
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
 if not QUANTGIST_API_KEY:
     raise RuntimeError("QUANTGIST_API_KEY is missing")
 
-
-# =========================
-# QUANTGIST REQUEST
-# =========================
 
 def quantgist_request(path, params=None):
     url = QUANTGIST_BASE_URL + path
@@ -57,38 +41,6 @@ def quantgist_request(path, params=None):
     return response.json()
 
 
-# =========================
-# EVENT EXTRACTION
-# =========================
-
-def extract_events(data):
-    if isinstance(data, list):
-        return data
-
-    if not isinstance(data, dict):
-        return []
-
-    # Common possible structures
-    for key in ("data", "events", "results", "items"):
-        value = data.get(key)
-
-        if isinstance(value, list):
-            return value
-
-        if isinstance(value, dict):
-            for nested_key in ("events", "results", "items", "data"):
-                nested = value.get(nested_key)
-
-                if isinstance(nested, list):
-                    return nested
-
-    return []
-
-
-# =========================
-# GET CALENDAR
-# =========================
-
 def get_calendar(days=14):
     return quantgist_request(
         "/macro/calendar",
@@ -102,22 +54,30 @@ def get_calendar(days=14):
     )
 
 
-# =========================
-# DEBUG COMMAND
-# =========================
- async def debug_command(
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "FundamentalX is online.\n\n"
+        "Use /debug to inspect QuantGist."
+    )
+
+
+async def debug_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     try:
         data = get_calendar(14)
+
         groups = data.get("data", [])
 
         lines = [
             "🔎 QUANTGIST DEBUG 3",
             "",
             f"Groups returned: {len(groups)}",
-            ""
+            "",
         ]
 
         for group in groups:
@@ -125,17 +85,19 @@ def get_calendar(days=14):
             label = group.get("label", "Unknown")
             country = group.get("country", "Unknown")
             count = group.get("count", 0)
-            nested = group.get("data", [])
+
+            nested_events = group.get("data", [])
 
             lines.append(
                 f"{alias} | {label} | {country}"
             )
+
             lines.append(
-                f"Count: {count} | Nested: {len(nested)}"
+                f"Count: {count} | Nested: {len(nested_events)}"
             )
 
-            if nested:
-                event = nested[0]
+            if nested_events:
+                event = nested_events[0]
 
                 lines.append(
                     f"First event keys: {list(event.keys())}"
@@ -156,12 +118,13 @@ def get_calendar(days=14):
 
                 lines.append("")
 
+        message = "\n".join(lines)
+
         await update.message.reply_text(
-            "\n".join(lines)[:4000]
+            message[:4000]
         )
 
     except requests.HTTPError as exc:
-
         status = (
             exc.response.status_code
             if exc.response is not None
@@ -181,40 +144,22 @@ def get_calendar(days=14):
         )
 
     except Exception as exc:
-
         await update.message.reply_text(
             "❌ DEBUG ERROR\n\n"
             f"{type(exc).__name__}: {exc}"
-                )
-# =========================
-# START
-# =========================
+        )
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "FundamentalX is online.\n\n"
-        "Commands:\n"
-        "/debug - test QuantGist connection"
-    )
-
-
-# =========================
-# HEALTH SERVER FOR RENDER
-# =========================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain",
         )
+
         self.end_headers()
 
         self.wfile.write(
@@ -226,7 +171,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def run_health_server():
-
     port = int(
         os.environ.get("PORT", 10000)
     )
@@ -238,10 +182,6 @@ def run_health_server():
 
     server.serve_forever()
 
-
-# =========================
-# MAIN
-# =========================
 
 def main():
 
